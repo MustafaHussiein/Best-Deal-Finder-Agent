@@ -1,0 +1,183 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import json
+from filters import extract_filters
+
+app = Flask(__name__)
+CORS(app)
+
+OLLAMA_URL = "http://127.0.0.1:11434/v1/chat/completions"
+
+# In-memory session storage
+sessions = {}
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    try:
+        data = request.get_json()
+        
+        session_id = data.get('session_id', f'session-{id(data)}')
+        message = data.get('message', '')
+        links = data.get('links', [])
+        user_prefs = data.get('user_prefs', {})
+        
+        # Initialize session memory if not exists
+        if session_id not in sessions:
+            sessions[session_id] = {'memory': [], 'filters': {}}
+        
+        session = sessions[session_id]
+        
+        # Extract filters from message
+        extracted_filters = extract_filters(message)
+        session['filters'].update(extracted_filters)
+        session['filters'].update(user_prefs)
+        
+        # Build context for LLM
+        context = build_context(message, links, session['memory'], session['filters'])
+        
+        # Call Ollama API with longer timeout for model loading
+        # First request may take longer as model loads into memory
+        ollama_response = requests.post(
+            OLLAMA_URL,
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "llama3.1:latest",
+                "messages": [{"role": "user", "content": context}],
+                "max_tokens": 500
+            },
+            timeout=120  # Increased to 120 seconds for model loading
+        )
+        
+        if not ollama_response.ok:
+            error_text = ollama_response.text
+            print(f"Ollama error: {ollama_response.status_code} {error_text}")
+            return jsonify({
+                "error": f"Ollama returned status {ollama_response.status_code}"
+            }), ollama_response.status_code
+        
+        ollama_data = ollama_response.json()
+        assistant_reply = ollama_data.get('choices', [{}])[0].get('message', {}).get('content', 'No response from model')
+        
+        # Generate mock offers (you can replace this with real scraping logic)
+        offers = generate_mock_offers(links, session['filters'])
+        
+        # Update memory (keep last 3 turns)
+        session['memory'].append({
+            'user': message,
+            'assistant': assistant_reply
+        })
+        if len(session['memory']) > 3:
+            session['memory'] = session['memory'][-3:]
+        
+        return jsonify({
+            'assistant_reply': assistant_reply,
+            'offers': offers,
+            'filters': session['filters'],
+            'memory': session['memory']
+        })
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Ollama: {e}")
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        print(f"Error in chat endpoint: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def build_context(message, links, memory, filters):
+    """Build context for LLM including conversation history and links"""
+    context_parts = []
+    
+    # Add conversation history
+    if memory:
+        context_parts.append("Conversation history:")
+        for turn in memory[-2:]:  # Last 2 turns
+            context_parts.append(f"User: {turn['user']}")
+            context_parts.append(f"Assistant: {turn['assistant'][:100]}...")
+        context_parts.append("")
+    
+    # Add current filters
+    if filters:
+        context_parts.append(f"Active filters: {json.dumps(filters)}")
+        context_parts.append("")
+    
+    # Add links if provided
+    if links:
+        context_parts.append(f"Product links to analyze: {', '.join(links)}")
+        context_parts.append("")
+    
+    # Add current message
+    context_parts.append(f"Current request: {message}")
+    
+    return "\n".join(context_parts)
+
+
+def generate_mock_offers(links, filters):
+    """Generate mock offers based on links and filters"""
+    offers = []
+    
+    # If links provided, create offers from them
+    if links:
+        for idx, link in enumerate(links[:5]):  # Max 5 offers
+            base_price = 79.99 + (idx * 10)
+            shipping = 5.99 if idx % 2 == 0 else 0
+            
+            # Apply price filter
+            if 'max_price' in filters and base_price > filters['max_price']:
+                base_price = filters['max_price'] - 10
+            
+            offer = {
+                'id': f'offer-{idx}',
+                'title': f'Product {idx + 1}',
+                'merchant': ['Amazon', 'eBay', 'Walmart', 'BestBuy'][idx % 4],
+                'price': round(base_price, 2),
+                'shipping': round(shipping, 2),
+                'total': round(base_price + shipping, 2),
+                'currency': '$',
+                'rating': round(4.0 + (idx * 0.2), 1),
+                'score': round(85 - (idx * 5), 0),
+                'sources': [link]
+            }
+            offers.append(offer)
+    else:
+        # Generate default mock offers
+        products = [
+            'Logitech MX Master 3S',
+            'Logitech MX Keys',
+            'Razer DeathAdder V3',
+            'Corsair K95 RGB',
+            'SteelSeries Arctis 7'
+        ]
+        
+        for idx, product in enumerate(products):
+            base_price = 69.99 + (idx * 15)
+            shipping = 0 if idx == 0 else 4.99
+            
+            # Apply price filter
+            if 'max_price' in filters and base_price > filters['max_price']:
+                continue
+            
+            offer = {
+                'id': f'offer-{idx}',
+                'title': product,
+                'merchant': ['Amazon', 'eBay', 'Newegg', 'BestBuy', 'Walmart'][idx],
+                'price': round(base_price, 2),
+                'shipping': round(shipping, 2),
+                'total': round(base_price + shipping, 2),
+                'currency': '$',
+                'rating': round(4.5 - (idx * 0.1), 1),
+                'score': round(95 - (idx * 5), 0),
+                'sources': [f'https://example.com/product/{idx}']
+            }
+            offers.append(offer)
+    
+    # Sort by score (descending)
+    offers.sort(key=lambda x: x['score'], reverse=True)
+    
+    return offers
+
+
+if __name__ == '__main__':
+    print("Backend running on http://localhost:4000")
+    app.run(host='0.0.0.0', port=4000, debug=True)
